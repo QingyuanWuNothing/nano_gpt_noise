@@ -33,6 +33,8 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn_negative = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn_positive = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -49,47 +51,216 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, x_lower=None, x_upper=None):
+        if x_lower is None:
+            x_lower = x.clone()
+        if x_upper is None:
+            x_upper = x.clone()
+
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+
+        with torch.no_grad():
+            mask_negative = self.c_attn.weight.data > 0
+            mask_positive = self.c_attn.weight.data < 0
+            c_attn_negative = self.c_attn.weight.data.clone()
+            c_attn_negative[mask_negative] = 0
+            self.c_attn_negative.weight = nn.Parameter(c_attn_negative)
+            c_attn_positive = self.c_attn.weight.data.clone()
+            c_attn_positive[mask_positive] = 0
+            self.c_attn_positive.weight = nn.Parameter(c_attn_positive)
+
+        with torch.no_grad():
+            q_upper_negative, k_upper_negative, v_upper_negative  = self.c_attn_negative(x_upper).split(self.n_embd, dim=2)
+            q_upper_positive, k_upper_positive, v_upper_positive  = self.c_attn_positive(x_upper).split(self.n_embd, dim=2)
+
+            q_lower_negative, k_lower_negative, v_lower_negative  = self.c_attn_negative(x_lower).split(self.n_embd, dim=2)
+            q_lower_positive, k_lower_positive, v_lower_positive  = self.c_attn_positive(x_lower).split(self.n_embd, dim=2)
+
+            q_lower = q_lower_positive + q_upper_negative
+            q_upper = q_upper_positive + q_lower_negative
+
+            k_lower = k_lower_positive + k_upper_negative
+            k_upper = k_upper_positive + k_lower_negative
+
+            v_lower = v_lower_positive + v_upper_negative
+            v_upper = v_upper_positive + v_lower_negative
+
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        with torch.no_grad():            
+            k_lower = k_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q_lower = q_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v_lower = v_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+            k_upper = k_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q_upper = q_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v_upper = v_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+
+            with torch.no_grad():
+                y_q_lower_k_lower_v_lower = torch.nn.functional.scaled_dot_product_attention(q_lower, k_lower, v_lower, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                y_q_lower_k_lower_v_upper = torch.nn.functional.scaled_dot_product_attention(q_lower, k_lower, v_upper, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                y_q_lower_k_upper_v_lower = torch.nn.functional.scaled_dot_product_attention(q_lower, k_upper, v_lower, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                y_q_lower_k_upper_v_upper = torch.nn.functional.scaled_dot_product_attention(q_lower, k_upper, v_upper, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                y_q_upper_k_lower_v_lower = torch.nn.functional.scaled_dot_product_attention(q_upper, k_lower, v_lower, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                y_q_upper_k_lower_v_upper = torch.nn.functional.scaled_dot_product_attention(q_upper, k_lower, v_upper, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                y_q_upper_k_upper_v_lower = torch.nn.functional.scaled_dot_product_attention(q_upper, k_upper, v_lower, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                y_q_upper_k_upper_v_upper = torch.nn.functional.scaled_dot_product_attention(q_upper, k_upper, v_upper, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            
+                y_all = torch.concat([
+                    y_q_lower_k_lower_v_lower.unsqueeze(0),
+                    y_q_lower_k_lower_v_upper.unsqueeze(0),
+                    y_q_lower_k_upper_v_lower.unsqueeze(0), 
+                    y_q_lower_k_upper_v_upper.unsqueeze(0),
+                    y_q_upper_k_lower_v_lower.unsqueeze(0), 
+                    y_q_upper_k_lower_v_upper.unsqueeze(0), 
+                    y_q_upper_k_upper_v_lower.unsqueeze(0),
+                    y_q_upper_k_upper_v_upper.unsqueeze(0),
+                ], dim=0)
+
+                y_lower = y_all.min(dim=0)[0]
+                y_upper = y_all.max(dim=0)[0]
+
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            with torch.no_grad():
+                att_q_lower_k_lower = (q_lower @ k_lower.transpose(-2, -1)) * (1.0 / math.sqrt(k_lower.size(-1)))
+                att_q_lower_k_upper = (q_lower @ k_upper.transpose(-2, -1)) * (1.0 / math.sqrt(k_upper.size(-1)))
+                att_q_upper_k_lower = (q_upper @ k_lower.transpose(-2, -1)) * (1.0 / math.sqrt(k_lower.size(-1)))
+                att_q_upper_k_upper = (q_upper @ k_upper.transpose(-2, -1)) * (1.0 / math.sqrt(k_upper.size(-1)))
+                att_all = torch.concat([
+                    att_q_lower_k_lower.unsqueeze(0), 
+                    att_q_lower_k_upper.unsqueeze(0), 
+                    att_q_upper_k_lower.unsqueeze(0), 
+                    att_q_upper_k_upper.unsqueeze(0), 
+                ], dim=0)
+
+                att_lower = att_all.min(dim=0)[0]
+                att_upper = att_all.max(dim=0)[0]
+
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            with torch.no_grad():
+                att_lower = att_lower.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att_upper = att_upper.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            
             att = F.softmax(att, dim=-1)
+            with torch.no_grad():
+                att_lower = F.softmax(att_lower, dim=-1)
+                att_upper = F.softmax(att_upper, dim=-1)
+
             att = self.attn_dropout(att)
+            with torch.no_grad():
+                att_lower = self.attn_dropout(att_lower)
+                att_upper = self.attn_dropout(att_upper)
+
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            with torch.no_grad():                
+                y_lower_lower = att_lower @ v_lower # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+                y_lower_upper = att_lower @ v_upper # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+                y_upper_lower = att_upper @ v_lower # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+                y_upper_upper = att_upper @ v_upper # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+                y_all = torch.concat([
+                    y_lower_lower.unsqueeze(0), 
+                    y_lower_upper.unsqueeze(0), 
+                    y_upper_lower.unsqueeze(0), 
+                    y_upper_upper.unsqueeze(0), 
+                ], dim=0)
+                y_lower = y_all.min(dim=0)[0]
+                y_upper = y_all.max(dim=0)[0]
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        with torch.no_grad():
+            y_lower = y_lower.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            y_upper = y_upper.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        with torch.no_grad():
+            y_lower = self.resid_dropout(self.c_proj(y_lower))
+            y_upper = self.resid_dropout(self.c_proj(y_upper))
+        return y, y_lower, y_upper
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc_negative    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc_positive    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj_negative  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj_positive  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x, x_lower=None, x_upper=None): 
+        if x_lower is None:
+            x_lower = x.clone()
+        if x_upper is None:
+            x_upper = x.clone()
+       
+        with torch.no_grad():
+            mask_negative = self.c_fc.weight.data > 0
+            mask_positive = self.c_fc.weight.data < 0
+            c_fc_negative = self.c_fc.weight.data.clone()
+            c_fc_negative[mask_negative] = 0
+            self.c_fc_negative.weight = nn.Parameter(c_fc_negative)
+            c_fc_positive = self.c_fc.weight.data.clone()
+            c_fc_positive[mask_positive] = 0
+            self.c_fc_positive.weight = nn.Parameter(c_fc_positive)
+
         x = self.c_fc(x)
+        with torch.no_grad():
+            x_lower_negative = self.c_fc_negative(x_lower)
+            x_lower_positive = self.c_fc_positive(x_lower)
+            x_upper_negative = self.c_fc_negative(x_upper)
+            x_upper_positive = self.c_fc_positive(x_upper)
+
+            x_lower = x_lower_positive + x_upper_negative
+            x_upper = x_upper_positive + x_lower_negative
+
         x = self.gelu(x)
+        with torch.no_grad():
+            x_lower = self.gelu(x_lower)
+            x_upper = self.gelu(x_upper)
+            
+            mask_negative = self.c_proj.weight.data > 0
+            mask_positive = self.c_proj.weight.data < 0
+            c_proj_negative = self.c_proj.weight.data.clone()
+            c_proj_negative[mask_negative] = 0
+            self.c_proj_negative.weight = nn.Parameter(c_proj_negative)
+            c_proj_positive = self.c_proj.weight.data.clone()
+            c_proj_positive[mask_positive] = 0
+            self.c_proj_positive.weight = nn.Parameter(c_proj_positive)
+
         x = self.c_proj(x)
+        with torch.no_grad():
+            x_lower_negative = self.c_proj_negative(x_lower)
+            x_lower_positive = self.c_proj_positive(x_lower)
+            x_upper_negative = self.c_proj_negative(x_upper)
+            x_upper_positive = self.c_proj_positive(x_upper)
+
+            x_lower = x_lower_positive + x_upper_negative
+            x_upper = x_upper_positive + x_lower_negative
+
         x = self.dropout(x)
-        return x
+        with torch.no_grad():
+            x_lower = self.dropout(x_lower)
+            x_upper = self.dropout(x_upper)
+
+        return x, x_lower, x_upper
 
 class Block(nn.Module):
 
@@ -100,10 +271,20 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    def forward(self, x, x_lower=None, x_upper=None):
+
+        attn_x, attn_x_lower, attn_x_upper = self.attn(self.ln_1(x), self.ln_1(x_lower), self.ln_1(x_upper))
+        x = x + attn_x
+        with torch.no_grad():
+            x_lower = x + attn_x_lower
+            x_upper = x + attn_x_upper
+
+        mlp_x, mlp_x_lower, mlp_x_upper = self.mlp(self.ln_2(x), self.ln_2(x_lower), self.ln_2(x_upper))
+        x = x + mlp_x
+        with torch.no_grad():
+            x_lower = x + mlp_x_lower
+            x_upper = x + mlp_x_upper
+        return x, x_lower, x_upper
 
 @dataclass
 class GPTConfig:
@@ -167,7 +348,13 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, input_error_lower=-1e-7, input_error_upper=1e-7):
+        infos = {
+            'x': [],
+            'x_lower': [],
+            'x_upper': [],
+            'bounded': [],
+        }
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -177,9 +364,31 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        with torch.no_grad():
+            x_lower = x + input_error_lower
+            x_upper = x + input_error_upper
+        infos['x'].append(x)
+        infos['x_lower'].append(x_lower)
+        infos['x_upper'].append(x_upper)
+        infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
+
         for block in self.transformer.h:
-            x = block(x)
+            x, x_lower, x_upper = block(x, x_lower, x_upper)
+            infos['x'].append(x)
+            infos['x_lower'].append(x_lower)
+            infos['x_upper'].append(x_upper)
+            infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
+            # infos['bounded'].append((x >= x_lower).all() and (x <= x_upper).all())
+
         x = self.transformer.ln_f(x)
+        with torch.no_grad():
+            x_lower = self.transformer.ln_f(x_lower)
+            x_upper = self.transformer.ln_f(x_upper)
+        infos['x'].append(x)
+        infos['x_lower'].append(x_lower)
+        infos['x_upper'].append(x_upper)
+        infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
+        # infos['bounded'].append((x >= x_lower).all() and (x <= x_upper).all())
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -190,7 +399,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, infos
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
