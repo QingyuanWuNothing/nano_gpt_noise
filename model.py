@@ -28,37 +28,31 @@ class LayerNorm(nn.Module):
         self.bias_negative = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input, input_lower=None, input_upper=None):
-        # return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-        # input: torch.Size([64, 256, 384])
-        # output: torch.Size([64, 256, 384])
-        eps=1e-5
-        if input_lower == None:
-            input_lower = input.clone()
-        if input_upper == None:
-            input_upper = input.clone()
-
-        # step 1: Propagation of the Mean
-        input_mean = input.mean(dim=(-2, -1), keepdim=True)
         with torch.no_grad():
+            eps=1e-5
+            if input_lower == None:
+                input_lower = input.clone()
+            if input_upper == None:
+                input_upper = input.clone()
+
+            # step 1: Propagation of the Mean
+            input_mean = input.mean(dim=(-2, -1), keepdim=True)
             input_lower_mean = input_lower.mean(dim=(-2, -1), keepdim=True) # m_a
             input_upper_mean = input_upper.mean(dim=(-2, -1), keepdim=True) # m_b
 
-        # step 2: Propagation of the Centered Differences
-        input_centered_diff = input - input_mean
-        with torch.no_grad():
+            # step 2: Propagation of the Centered Differences
+            input_centered_diff = input - input_mean
             input_lower_centered_diff = input_lower - input_lower_mean # d_a
             input_upper_centered_diff = input_upper - input_upper_mean # d_b
 
-        # step 3: Propagation of the Squared Differences (Variance)
-        input_variance = input.var(dim=(-2, -1), keepdim=True, unbiased=False)
-        with torch.no_grad():
+            # step 3: Propagation of the Squared Differences (Variance)
+            input_variance = input.var(dim=(-2, -1), keepdim=True, unbiased=False)
             input_lower_variance = input_lower.var(dim=(-2, -1), keepdim=True, unbiased=False) # v_a
             input_upper_variance = input_upper.var(dim=(-2, -1), keepdim=True, unbiased=False) # v_b
 
-        # step 4: ropagation of the Division
-        input_division = torch.sqrt(input_variance + eps)
-        input_normalized = input_centered_diff / input_division
-        with torch.no_grad():
+            # step 4: ropagation of the Division
+            input_division = torch.sqrt(input_variance + eps)
+            input_normalized = input_centered_diff / input_division
             input_lower_division = torch.sqrt(input_lower_variance + eps) # z_a
             input_upper_division = torch.sqrt(input_upper_variance + eps) # z_b
             input_lower_upper_normalized = torch.concat([
@@ -71,9 +65,8 @@ class LayerNorm(nn.Module):
             input_upper_normalized = input_lower_upper_normalized.max(dim=0)[0]
 
 
-        # step 5: Scaling and Shifting
-        output_normalized = input_normalized * self.weight
-        with torch.no_grad():
+            # step 5: Scaling and Shifting
+            output_normalized = input_normalized * self.weight
             mask_positive = self.weight >= 0
             mask_negative = self.weight < 0
 
@@ -89,7 +82,7 @@ class LayerNorm(nn.Module):
             output_normalized_upper = input_upper_normalized * self.weight_positive
             output_normalized_upper += input_lower_normalized * self.weight_negative
 
-        return output_normalized, output_normalized_lower, output_normalized_upper
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5), output_normalized_lower, output_normalized_upper
 
 class CausalSelfAttention(nn.Module):
 
@@ -454,7 +447,7 @@ class GPT(nn.Module):
         infos['x_lower'].append(x_lower)
         infos['x_upper'].append(x_upper)
         infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
-        infos['bounded'] = infos['bounded'].detach().cpu().item()
+        # infos['bounded'] = infos['bounded'].detach().cpu().item()
         # infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
         # infos['bounded'].append((x >= x_lower).all() and (x <= x_upper).all())
 
