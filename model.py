@@ -342,15 +342,15 @@ class Block(nn.Module):
         attn_x, attn_x_lower, attn_x_upper = self.attn(x, x_lower, x_upper)
         x = x + attn_x
         with torch.no_grad():
-            x_lower = x + attn_x_lower
-            x_upper = x + attn_x_upper
+            x_lower = x_lower + attn_x_lower
+            x_upper = x_upper + attn_x_upper
 
         x, x_lower, x_upper = self.ln_2(x, x_lower, x_upper)
         mlp_x, mlp_x_lower, mlp_x_upper = self.mlp(x, x_lower, x_upper)
         x = x + mlp_x
         with torch.no_grad():
-            x_lower = x + mlp_x_lower
-            x_upper = x + mlp_x_upper
+            x_lower = x_lower + mlp_x_lower
+            x_upper = x_upper + mlp_x_upper
         return x, x_lower, x_upper
 
 @dataclass
@@ -415,12 +415,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, input_error_lower=-1e-7, input_error_upper=1e-7):
+    def forward(self, idx, targets=None, input_error_lower=-1e-3, input_error_upper=1e-3):
         infos = {
             'x': [],
             'x_lower': [],
             'x_upper': [],
-            'bounded': [],
+            'bounded': True,
         }
         device = idx.device
         b, t = idx.size()
@@ -437,14 +437,15 @@ class GPT(nn.Module):
         infos['x'].append(x)
         infos['x_lower'].append(x_lower)
         infos['x_upper'].append(x_upper)
-        infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
+        infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
 
         for block in self.transformer.h:
             x, x_lower, x_upper = block(x, x_lower, x_upper)
             infos['x'].append(x)
             infos['x_lower'].append(x_lower)
             infos['x_upper'].append(x_upper)
-            infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
+            infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
+            # infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
             # infos['bounded'].append((x >= x_lower).all() and (x <= x_upper).all())
 
         x, x_lower, x_upper = self.transformer.ln_f(x, x_lower, x_upper)
@@ -452,7 +453,9 @@ class GPT(nn.Module):
         infos['x'].append(x)
         infos['x_lower'].append(x_lower)
         infos['x_upper'].append(x_upper)
-        infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
+        infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
+        infos['bounded'] = infos['bounded'].detach().cpu().item()
+        # infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
         # infos['bounded'].append((x >= x_lower).all() and (x <= x_upper).all())
 
         if targets is not None:
