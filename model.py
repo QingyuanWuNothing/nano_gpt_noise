@@ -408,7 +408,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, input_error_lower=-1e-3, input_error_upper=1e-3):
+    def forward(self, idx, targets=None, input_error_lower=-1e-3, input_error_upper=1e-3, noising_input=False):
         infos = {
             'x': [],
             'x_lower': [],
@@ -424,6 +424,8 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        if noising_input:
+            x = x + (torch.rand_like(x).to(device) * (input_error_upper - input_error_lower) + input_error_lower)
         with torch.no_grad():
             x_lower = x + input_error_lower
             x_upper = x + input_error_upper
@@ -454,10 +456,12 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            logits += (torch.rand_like(logits).to(device) * (input_error_upper - input_error_lower) + input_error_lower)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits += (torch.rand_like(logits).to(device) * (input_error_upper - input_error_lower) + input_error_lower)
             loss = None
 
         return logits, loss, infos

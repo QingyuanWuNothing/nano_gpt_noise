@@ -24,6 +24,8 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+# import torch_npu 
+# from torch_npu.contrib import transfer_to_npu
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -36,7 +38,7 @@ out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
+eval_only = True # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
@@ -71,7 +73,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -211,6 +213,12 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+    
+model_cpu = GPT(gptconf).to("cpu")
+
+input_error_lower=-1e-3
+input_error_upper=1e-3
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -219,11 +227,26 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
+            # npu output
             X, Y = get_batch(split)
+            
             with ctx:
                 logits, loss, infos = model(X, Y)
-                print(infos['bounded'])
-            losses[k] = loss.item()
+            losses[k] = loss.item() 
+            # print(infos["x"][-1] >= infos["x_lower"][-1])
+            # print(infos["x"][-1] <= infos["x_upper"][-1])           
+            # print(infos['bounded'])
+            # exit()
+            # cpu lower upper bound
+            model_cpu.load_state_dict(model.state_dict())
+            # model_cpu.to("cpu")
+            logits_cpu, loss_cpu, infos_cpu = model_cpu(X.to("cpu"), Y.to("cpu"), input_error_lower=input_error_lower, input_error_upper=input_error_upper, noising_input=True)
+            print(infos["x"][-1].to("cpu") >= infos_cpu["x_lower"][-1])
+            print(infos["x"][-1].to("cpu") <= infos_cpu["x_upper"][-1])
+            is_bounded = (infos["x"][-1].to("cpu") >= infos_cpu["x_lower"][-1]).all() and (infos["x"][-1].to("cpu") <= infos_cpu["x_upper"][-1]).all()
+            print(is_bounded)
+            # is_bounded = is_bounded.any()
+            exit()
         out[split] = losses.mean()
     model.train()
     return out
@@ -288,31 +311,31 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss, infos = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+    # # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # # and using the GradScaler if data type is float16
+    # for micro_step in range(gradient_accumulation_steps):
+    #     if ddp:
+    #         # in DDP training we only need to sync gradients at the last micro step.
+    #         # the official way to do this is with model.no_sync() context manager, but
+    #         # I really dislike that this bloats the code and forces us to repeat code
+    #         # looking at the source of that context manager, it just toggles this variable
+    #         model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+    #     with ctx:
+    #         logits, loss, infos = model(X, Y)
+    #         loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+    #     # immediately async prefetch next batch while model is doing the forward pass on the GPU
+    #     X, Y = get_batch('train')
+    #     # backward pass, with gradient scaling if training in fp16
+    #     scaler.scale(loss).backward()
+    # # clip the gradient
+    # if grad_clip != 0.0:
+    #     scaler.unscale_(optimizer)
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # # step the optimizer and scaler if training in fp16
+    # scaler.step(optimizer)
+    # scaler.update()
+    # # flush the gradients as soon as we can, no need for this memory anymore
+    # optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
