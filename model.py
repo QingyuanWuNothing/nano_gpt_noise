@@ -429,10 +429,10 @@ class GPT(nn.Module):
         with torch.no_grad():
             x_lower = x + input_error_lower
             x_upper = x + input_error_upper
-        infos['x'].append(x)
-        infos['x_lower'].append(x_lower)
-        infos['x_upper'].append(x_upper)
-        infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
+        # infos['x'].append(x)
+        # infos['x_lower'].append(x_lower)
+        # infos['x_upper'].append(x_upper)
+        # infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
 
         for block in self.transformer.h:
             x, x_lower, x_upper = block(x, x_lower, x_upper)

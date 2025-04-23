@@ -240,11 +240,12 @@ def estimate_loss():
             # cpu lower upper bound
             model_cpu.load_state_dict(model.state_dict())
             # model_cpu.to("cpu")
-            logits_cpu, loss_cpu, infos_cpu = model_cpu(X.to("cpu"), Y.to("cpu"), input_error_lower=input_error_lower, input_error_upper=input_error_upper, noising_input=True)
-            print(infos["x"][-1].to("cpu") >= infos_cpu["x_lower"][-1])
-            print(infos["x"][-1].to("cpu") <= infos_cpu["x_upper"][-1])
-            is_bounded = (infos["x"][-1].to("cpu") >= infos_cpu["x_lower"][-1]).all() and (infos["x"][-1].to("cpu") <= infos_cpu["x_upper"][-1]).all()
-            print(is_bounded)
+            logits_cpu, loss_cpu, infos_cpu = model_cpu(X.to("cpu"), Y.to("cpu"), input_error_lower=input_error_lower, input_error_upper=input_error_upper, noising_input=False)
+            for layer_i in range(len(infos["x"])):
+                # print(infos["x"][layer_i].to("cpu") >= infos_cpu["x_lower"][layer_i])
+                # print(infos["x"][layer_i].to("cpu") <= infos_cpu["x_upper"][layer_i])
+                is_bounded = (infos["x"][layer_i].to("cpu") >= infos_cpu["x_lower"][layer_i]).all() and (infos["x"][layer_i].to("cpu") <= infos_cpu["x_upper"][layer_i]).all()
+                print(is_bounded)
             # is_bounded = is_bounded.any()
             exit()
         out[split] = losses.mean()
