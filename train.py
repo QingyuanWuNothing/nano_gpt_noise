@@ -38,11 +38,11 @@ out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
-eval_only = True # if True, script exits right after the first eval
+eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
@@ -229,25 +229,12 @@ def estimate_loss():
         for k in range(eval_iters):
             # npu output
             X, Y = get_batch(split)
-            
             with ctx:
                 logits, loss, infos = model(X, Y)
             losses[k] = loss.item() 
-            # print(infos["x"][-1] >= infos["x_lower"][-1])
-            # print(infos["x"][-1] <= infos["x_upper"][-1])           
-            # print(infos['bounded'])
-            # exit()
             # cpu lower upper bound
-            model_cpu.load_state_dict(model.state_dict())
-            # model_cpu.to("cpu")
-            logits_cpu, loss_cpu, infos_cpu = model_cpu(X.to("cpu"), Y.to("cpu"), input_error_lower=input_error_lower, input_error_upper=input_error_upper, noising_input=False)
-            for layer_i in range(len(infos["x"])):
-                # print(infos["x"][layer_i].to("cpu") >= infos_cpu["x_lower"][layer_i])
-                # print(infos["x"][layer_i].to("cpu") <= infos_cpu["x_upper"][layer_i])
-                is_bounded = (infos["x"][layer_i].to("cpu") >= infos_cpu["x_lower"][layer_i]).all() and (infos["x"][layer_i].to("cpu") <= infos_cpu["x_upper"][layer_i]).all()
-                print(is_bounded)
-            # is_bounded = is_bounded.any()
-            exit()
+            # model_cpu.load_state_dict(model.state_dict())
+            # logits_cpu, loss_cpu, infos_cpu = model_cpu(X.to("cpu"), Y.to("cpu"), input_error_lower=input_error_lower, input_error_upper=input_error_upper, noising_input=False)
         out[split] = losses.mean()
     model.train()
     return out
@@ -269,7 +256,12 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.init(
+        entity="qingyuanwu",
+        project=wandb_project, 
+        name=wandb_run_name, 
+        config=config
+    )
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -312,31 +304,31 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # # and using the GradScaler if data type is float16
-    # for micro_step in range(gradient_accumulation_steps):
-    #     if ddp:
-    #         # in DDP training we only need to sync gradients at the last micro step.
-    #         # the official way to do this is with model.no_sync() context manager, but
-    #         # I really dislike that this bloats the code and forces us to repeat code
-    #         # looking at the source of that context manager, it just toggles this variable
-    #         model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-    #     with ctx:
-    #         logits, loss, infos = model(X, Y)
-    #         loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-    #     # immediately async prefetch next batch while model is doing the forward pass on the GPU
-    #     X, Y = get_batch('train')
-    #     # backward pass, with gradient scaling if training in fp16
-    #     scaler.scale(loss).backward()
-    # # clip the gradient
-    # if grad_clip != 0.0:
-    #     scaler.unscale_(optimizer)
-    #     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # # step the optimizer and scaler if training in fp16
-    # scaler.step(optimizer)
-    # scaler.update()
-    # # flush the gradients as soon as we can, no need for this memory anymore
-    # optimizer.zero_grad(set_to_none=True)
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
+    for micro_step in range(gradient_accumulation_steps):
+        if ddp:
+            # in DDP training we only need to sync gradients at the last micro step.
+            # the official way to do this is with model.no_sync() context manager, but
+            # I really dislike that this bloats the code and forces us to repeat code
+            # looking at the source of that context manager, it just toggles this variable
+            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        with ctx:
+            logits, loss, infos = model(X, Y)
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        X, Y = get_batch('train')
+        # backward pass, with gradient scaling if training in fp16
+        scaler.scale(loss).backward()
+    # clip the gradient
+    if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # step the optimizer and scaler if training in fp16
+    scaler.step(optimizer)
+    scaler.update()
+    # flush the gradients as soon as we can, no need for this memory anymore
+    optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
